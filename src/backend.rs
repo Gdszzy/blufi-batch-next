@@ -129,6 +129,14 @@ fn kind_for_services(services: impl Iterator<Item = Uuid>, name: &str) -> Option
 }
 
 fn project_scan_filter(filter: DeviceFilter) -> ScanFilter {
+    // WinRT filters individual advertisement packets. In particular, our combined
+    // service filter drops valid devices on Windows, and even a single UUID can
+    // discard a separate scan response containing the name. Receive both packets
+    // so btleplug can merge their properties, then enforce UUID/name/model rules
+    // in advertised_project_kind before anything enters the processing queue.
+    if cfg!(target_os = "windows") {
+        return ScanFilter::default();
+    }
     let services = match filter {
         DeviceFilter::Auto => vec![BLUFI, SA01, SA02],
         DeviceFilter::Blufi => vec![BLUFI],
@@ -919,38 +927,74 @@ pub async fn diagnose() -> Result<()> {
         env!("CARGO_PKG_VERSION"),
         std::env::consts::OS
     );
-    let manager = Manager::new().await.context("无法连接系统蓝牙服务")?;
-    let adapters = timeout(BLE_TIMEOUT, manager.adapters()).await??;
+    let manager = timeout(BLE_TIMEOUT, Manager::new())
+        .await
+        .context("连接系统蓝牙服务超时")?
+        .context("无法连接系统蓝牙服务")?;
+    let adapters = timeout(BLE_TIMEOUT, manager.adapters())
+        .await
+        .context("枚举蓝牙适配器超时")?
+        .context("无法枚举蓝牙适配器")?;
     if adapters.is_empty() {
         bail!("未发现 BLE 适配器；应用仍可打开配置界面，初始化需要可用蓝牙硬件");
     }
     for adapter in adapters {
-        println!("适配器: {}", adapter.adapter_info().await?);
-        timeout(
-            BLE_TIMEOUT,
-            adapter.start_scan(ScanFilter {
-                services: vec![BLUFI, SA01, SA02],
-            }),
-        )
-        .await??;
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let devices = adapter.peripherals().await?;
-        let mut count = 0;
+        let info = timeout(BLE_TIMEOUT, adapter.adapter_info())
+            .await
+            .context("读取适配器信息超时")?
+            .context("无法读取适配器信息")?;
+        println!("适配器: {info}");
+        let scan_filter = project_scan_filter(DeviceFilter::Auto);
+        println!(
+            "扫描策略: {}；扫描 6 秒，仅统计广播，不连接设备",
+            if scan_filter.services.is_empty() {
+                "系统不限制服务 UUID，应用层筛选项目设备"
+            } else {
+                "系统按项目服务 UUID 筛选，应用层核对设备名称"
+            }
+        );
+        timeout(BLE_TIMEOUT, adapter.start_scan(scan_filter))
+            .await
+            .context("开始扫描超时")?
+            .context("无法开始扫描")?;
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        // Both WinRT and BlueZ retain discovered properties after stopping. Stop
+        // before reading them so a later enumeration/property error cannot leave
+        // a diagnostic scan running. The snapshot can include OS-cached devices.
+        timeout(BLE_TIMEOUT, adapter.stop_scan())
+            .await
+            .context("停止诊断扫描超时")?
+            .context("无法停止诊断扫描")?;
+        let devices = timeout(BLE_TIMEOUT, adapter.peripherals())
+            .await
+            .context("读取扫描结果超时")?
+            .context("无法读取扫描结果")?;
+        let total = devices.len();
+        let mut service_matches = 0;
+        let mut project_matches = 0;
+        let mut unavailable_properties = 0;
         for device in devices {
-            if let Some(properties) = device.properties().await? {
-                let name = properties.local_name.as_deref().unwrap_or_default();
-                if [DeviceFilter::Blufi, DeviceFilter::Smartcard]
-                    .into_iter()
-                    .any(|filter| {
-                        advertised_project_kind(&properties.services, name, filter).is_some()
-                    })
-                {
-                    count += 1;
+            let properties = match timeout(Duration::from_secs(3), device.properties()).await {
+                Ok(Ok(Some(properties))) => properties,
+                _ => {
+                    unavailable_properties += 1;
+                    continue;
                 }
+            };
+            let name = properties.local_name.as_deref().unwrap_or_default();
+            if kind_for_services(properties.services.iter().copied(), name).is_some() {
+                service_matches += 1;
+            }
+            if advertised_project_kind(&properties.services, name, DeviceFilter::Auto).is_some() {
+                project_matches += 1;
             }
         }
-        println!("扫描可用，发现 {count} 台项目设备");
-        adapter.stop_scan().await?;
+        println!(
+            "扫描结束：系统设备记录 {total} 台，匹配项目服务 {service_matches} 台，符合项目准入 {project_matches} 台"
+        );
+        println!(
+            "属性不可读 {unavailable_properties} 台（失败、超时或尚无属性）；统计可能包含系统缓存，不应用批次 RSSI 门槛"
+        );
     }
     Ok(())
 }
@@ -979,7 +1023,17 @@ mod tests {
     }
 
     #[test]
-    fn project_type_selection_is_applied_before_queueing() {
+    fn native_scan_filter_preserves_platform_discovery_requirements() {
+        if cfg!(target_os = "windows") {
+            for filter in [
+                DeviceFilter::Auto,
+                DeviceFilter::Blufi,
+                DeviceFilter::Smartcard,
+            ] {
+                assert!(project_scan_filter(filter).services.is_empty());
+            }
+            return;
+        }
         assert_eq!(
             project_scan_filter(DeviceFilter::Auto).services,
             vec![BLUFI, SA01, SA02]
@@ -992,6 +1046,30 @@ mod tests {
             project_scan_filter(DeviceFilter::Smartcard).services,
             vec![SA01, SA02]
         );
+    }
+
+    #[test]
+    fn blufi_requires_name_until_advertisement_properties_are_complete() {
+        assert_eq!(
+            advertised_project_kind(&[BLUFI], "", DeviceFilter::Auto),
+            None
+        );
+        assert_eq!(
+            advertised_project_kind(&[BLUFI], "SMCD123456", DeviceFilter::Auto),
+            Some(DeviceKind::BlufiNew)
+        );
+        assert_eq!(
+            advertised_project_kind(&[SA01], "", DeviceFilter::Auto),
+            Some(DeviceKind::Sa01a2)
+        );
+        assert_eq!(
+            advertised_project_kind(&[SA02], "", DeviceFilter::Auto),
+            Some(DeviceKind::Sa02a1)
+        );
+    }
+
+    #[test]
+    fn project_type_selection_is_applied_before_queueing() {
         assert_eq!(
             advertised_project_kind(&[SA02], "SMCD123456", DeviceFilter::Auto),
             Some(DeviceKind::Sa02a1)

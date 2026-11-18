@@ -18,7 +18,7 @@ Linux 使用 BlueZ / D-Bus，Windows 使用 WinRT。旧工具的初始化操作�
 
 协议连接 / 握手完成后默认等待 5 秒再读取设备信息，配置中可设为 0–60 秒（0 表示不等待）。支持 Modem 的 SMCE 4G BLUFI 和 SA02A1 必须成功返回非空 Modem 版本与 ICCID；缺失、空值或读取失败都会中止该设备流程。
 
-扫描按项目服务 UUID 筛选。BLUFI 还要求 `SMCD` / `SMCE` 名称前缀，避免把其他产品的通用 BLUFI 服务当作本项目设备；SA01A2 / SA02A1 使用各自专用服务 UUID。进入队列前再次核对当前机型筛选，无关设备和其他已排除机型不会显示或计入异常。
+扫描按项目服务 UUID 筛选。Linux 在系统扫描阶段传入服务 UUID；Windows 使用无服务 UUID 过滤的扫描，再由应用检查广播属性，避免 WinRT 多服务过滤漏掉目标设备，也让分开发送的名称与服务广播都能被接收。BLUFI 仍要求项目服务 UUID 及 `SMCD` / `SMCE` 名称前缀，避免把其他产品的通用 BLUFI 服务当作本项目设备；SA01A2 / SA02A1 使用各自专用服务 UUID。进入队列前再次核对当前机型筛选，无关设备和其他已排除机型不会显示或计入异常。
 
 设备服务：
 
@@ -59,7 +59,7 @@ cargo build --locked --release
 ./target/release/blufi-batch-next --diagnose
 ```
 
-该命令枚举适配器、扫描三秒并停止；只统计本项目支持的设备，不展示周围其他蓝牙设备。
+该命令枚举适配器，使用与批次相同的平台扫描策略，扫描六秒后停止。输出系统设备记录总数、项目服务匹配数、通过项目准入检查的设备数，以及属性不可读的设备数。统计可能包含系统缓存，不应用批次 RSSI 门槛；仅输出计数，不展示周围无关设备的身份信息，不连接或初始化设备。
 
 界面固定采用亮色主题，支持 X11 / Wayland。运行时优先加载常规字重的系统中文字体（Noto Sans CJK / Droid Sans Fallback，Windows 使用微软雅黑），避免可变字体被渲染成过细字重；缺少字体时会提示安装。
 
@@ -78,7 +78,13 @@ cargo build --locked --release
 .\target\release\blufi-batch-next.exe
 ```
 
-Windows 代码使用 btleplug 的真实 WinRT 后端，不是空实现或 Linux 命令替代。界面采用 Windows 原生窗口和系统字体；不需要 BlueZ 或 D-Bus。当前尚未在 Windows 编译或实机测试；`.github/workflows/build.yml` 配置了 Linux / Windows 原生构建与协议测试，但尚无 CI 执行结果。Windows 首次测试应先关闭所有写入操作，确认发现、连接和读取，再逐项开启初始化操作。
+Windows 代码使用 btleplug 的真实 WinRT 后端，不是空实现或 Linux 命令替代。界面采用 Windows 原生窗口和系统字体；不需要 BlueZ 或 D-Bus。已完成 Windows 本机构建和 BLE 广播扫描验证；`.github/workflows/build.yml` 配置了 Linux / Windows 原生构建与协议测试，但尚无 CI 执行结果。完整初始化及 Smartcard 真机流程仍待验证；首次连接测试应先关闭所有写入操作，确认连接和读取，再逐项开启初始化操作。
+
+只检查蓝牙时，在 PowerShell 中运行以下命令。程序使用 Windows GUI 子系统，通过管道获取诊断输出：
+
+```powershell
+& .\target\release\blufi-batch-next.exe --diagnose 2>&1 | Out-String
+```
 
 ## 批次操作
 
@@ -145,8 +151,12 @@ cargo test --locked
 
 此前已通过 23 项协议与配置回归测试；本次新增设备范围过滤后，针对后端运行的 5 项测试全部通过，覆盖无关广播排除、当前机型准入和原有信息检查。真实 Linux BlueZ 项目范围扫描识别到 17 台项目设备，未执行设备初始化。系统密码库跨进程恢复、JSON 不含明文密码及保存配置后直接开始也已验证。
 
+Windows 原生广播对照已复现旧扫描策略的问题：各扫描六秒，无服务过滤及仅 BLUFI 服务过滤均发现同一台项目设备，同时传入三个项目服务 UUID 时发现数为零。由此定位到当前环境下的多服务系统过滤未满足项目所需的“匹配任一服务即可”行为。
+
+此次 Windows 扫描修复已通过 `cargo test --locked --release` 的全部 36 项测试，以及 `cargo build --locked --release`。修复后的诊断读取到 15 条系统设备记录，项目服务匹配数为 0；同期独立 WinRT 与 btleplug 对照也均未收到目标设备广播，停止扫描前后设备记录数一致。因此已验证 Windows 广播接收与诊断统计，目标设备恢复广播后的项目发现仍待真机复验，未执行连接或初始化。
+
 亮色界面以临时视觉验收程序检查了长名称 / 错误信息截断、单列 20 条队列、三类弹窗居中和 900×560 小窗口下的按钮可达性；还验证了动作配置直接保存、切换机型后无关记录隐藏。最低电量滑块在生产程序的隔离配置中验证了 0%、100% 及禁用值的保存。临时数据不代表真实设备初始化结果，验收程序不随工具交付。
 
-**未验证**：五类嵌入式设备各自的完整真机初始化、真实 WiFi 联网、企业 SN / ICCID 接口、固件升级结果及 Windows 平台运行。自动测试与蓝牙扫描不替代这些产线验收。验证过程未执行设备清空、身份分配或升级。
+**未验证**：五类嵌入式设备各自的完整真机初始化、真实 WiFi 联网、企业 SN / ICCID 接口、固件升级结果，以及 Windows 下的完整初始化和 Smartcard 真机流程。自动测试与蓝牙扫描不替代这些产线验收。验证过程未执行设备清空、身份分配或升级。
 
 协议来源是相邻 `blufi-web` 的 `src/types/`、连接 composable、`src/proto/*.proto` 与 `docs/ble_rpc_*.md`，初始化业务来源是相邻 `blufi-batch-win/src/main.cpp`。BLUFI 传输参考 [Espressif BLUFI 文档](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-guides/ble/blufi.html)。
