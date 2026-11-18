@@ -1,0 +1,31 @@
+[package]
+name = "blufi-batch-next"
+version = "0.1.0"
+edition = "2024"
+description = "Native cross-platform batch provisioning for BLUFI and Smartcard devices"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+btleplug = "0.11.8"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+uuid = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+directories = "6"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+csv = "1"
+prost = "0.14"
+aes = "0.8"
+cfb-mode = "0.8"
+md-5 = "0.10"
+num-bigint = { version = "0.4", features = ["rand"] }
+rand = "0.8"
+keyring = "4.2"
+
+[profile.release]
+lto = "thin"
+strip = true

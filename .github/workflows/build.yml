@@ -1,0 +1,30 @@
+name: Native builds
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux native dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config libxkbcommon-dev libwayland-dev libegl1-mesa-dev libgl1-mesa-dev
+      - name: Protocol and safety regressions
+        run: cargo test --locked
+      - name: Release binary
+        run: cargo build --locked --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blufi-batch-next-${{ runner.os }}
+          path: |
+            target/release/blufi-batch-next
+            target/release/blufi-batch-next.exe
+          if-no-files-found: error
